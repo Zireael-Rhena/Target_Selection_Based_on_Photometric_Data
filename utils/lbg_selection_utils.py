@@ -357,3 +357,190 @@ def summarize_lbg_selection(results_dict: Dict[str, Dict]) -> None:
     print("-" * 70)
     lbg_pct = lbg_all / total_all * 100 if total_all > 0 else 0
     print(f"{'TOTAL':<15} | {total_all:>8} | {'-':>10} | {lbg_all:>8} | {non_lbg_all:>10} | {lbg_pct:>7.1f}%")
+
+def get_training_samples(
+    specz_result:  Dict,
+    only_reliable: bool = True,
+    balance_classes: bool = False,
+    random_state: int = 42
+) -> Dict: 
+    """
+    从 LBG 筛选结果生成训练样本。
+    
+    Parameters
+    ----------
+    specz_result : dict
+        select_lbg_from_specz 的返回结果
+    only_reliable : bool
+        是否只使用可靠红移的样本 (推荐 True)
+    balance_classes :  bool
+        是否平衡正负样本数量 (下采样多数类)
+    random_state : int
+        随机种子
+        
+    Returns
+    -------
+    samples : dict
+        - 'table': 训练样本表格
+        - 'labels': 二分类标签 (0/1)
+        - 'z_values': 红移值
+        - 'stats': 统计信息
+    """
+    
+    if only_reliable:
+        # 合并 LBG 和 Non-LBG (都是可靠红移)
+        from astropy.table import vstack
+        
+        lbg_table = specz_result['lbg_table']. copy()
+        non_lbg_table = specz_result['non_lbg_table'].copy()
+        
+        # 确保标签正确
+        lbg_table['IS_LBG'] = 1
+        non_lbg_table['IS_LBG'] = 0
+        
+        combined_table = vstack([lbg_table, non_lbg_table])
+        
+    else:
+        # 使用完整表格 (包含不可靠红移，不推荐)
+        combined_table = specz_result['full_table'].copy()
+    
+    n_pos = np.sum(combined_table['IS_LBG'] == 1)
+    n_neg = np.sum(combined_table['IS_LBG'] == 0)
+    
+    # 可选：平衡类别
+    if balance_classes and n_pos != n_neg:
+        np.random.seed(random_state)
+        
+        pos_idx = np.where(combined_table['IS_LBG'] == 1)[0]
+        neg_idx = np.where(combined_table['IS_LBG'] == 0)[0]
+        
+        n_min = min(n_pos, n_neg)
+        
+        if n_pos > n_neg:
+            # 下采样正样本
+            sampled_pos = np.random. choice(pos_idx, n_min, replace=False)
+            keep_idx = np.concatenate([sampled_pos, neg_idx])
+        else:
+            # 下采样负样本
+            sampled_neg = np.random.choice(neg_idx, n_min, replace=False)
+            keep_idx = np.concatenate([pos_idx, sampled_neg])
+        
+        combined_table = combined_table[keep_idx]
+        n_pos = n_neg = n_min
+    
+    labels = np.array(combined_table['IS_LBG'])
+    z_values = np.array(combined_table['Z_BEST'])
+    
+    stats = {
+        'n_total': len(combined_table),
+        'n_positive': int(n_pos),
+        'n_negative': int(n_neg),
+        'pos_ratio': n_pos / len(combined_table) * 100,
+        'only_reliable': only_reliable,
+        'balanced':  balance_classes
+    }
+    
+    print("\n" + "=" * 50)
+    print("Training Sample Summary")
+    print("=" * 50)
+    print(f"  Only reliable redshifts: {only_reliable}")
+    print(f"  Class balancing: {balance_classes}")
+    print(f"\n  Sample counts:")
+    print(f"    - Positive (LBG):     {stats['n_positive']: 5d}")
+    print(f"    - Negative (Non-LBG): {stats['n_negative']:5d}")
+    print(f"    - Total:              {stats['n_total']:5d}")
+    print(f"    - Positive ratio:     {stats['pos_ratio']:.1f}%")
+    
+    return {
+        'table':  combined_table,
+        'labels': labels,
+        'z_values': z_values,
+        'stats': stats
+    }
+
+
+def prepare_training_data_from_multiple_fields(
+    results_dict: Dict[str, Dict],
+    only_reliable: bool = True,
+    test_field: str = None,
+    verbose: bool = True
+) -> Dict:
+    """
+    从多个天区准备训练数据，可选择留出一个天区作为测试集。
+    
+    Parameters
+    ----------
+    results_dict : dict
+        键为天区名，值为 select_lbg_from_specz 的返回结果
+    only_reliable : bool
+        是否只使用可靠红移
+    test_field : str or None
+        留出作为测试集的天区名，None 表示混合所有天区
+    verbose : bool
+        是否打印信息
+        
+    Returns
+    -------
+    data : dict
+        - 'train_table': 训练集表格
+        - 'train_labels': 训练标签
+        - 'test_table': 测试集表格 (如果指定了 test_field)
+        - 'test_labels':  测试标签
+        - 'stats': 统计信息
+    """
+    from astropy.table import vstack
+    
+    train_tables = []
+    test_tables = []
+    
+    for field, result in results_dict.items():
+        lbg_table = result['lbg_table']. copy()
+        non_lbg_table = result['non_lbg_table'].copy()
+        
+        lbg_table['IS_LBG'] = 1
+        lbg_table['FIELD'] = field
+        non_lbg_table['IS_LBG'] = 0
+        non_lbg_table['FIELD'] = field
+        
+        field_table = vstack([lbg_table, non_lbg_table])
+        
+        if test_field and field == test_field:
+            test_tables.append(field_table)
+        else:
+            train_tables.append(field_table)
+    
+    # 合并
+    train_table = vstack(train_tables) if train_tables else None
+    test_table = vstack(test_tables) if test_tables else None
+    
+    result = {
+        'train_table': train_table,
+        'train_labels': np.array(train_table['IS_LBG']) if train_table else None,
+        'train_z':  np.array(train_table['Z_BEST']) if train_table else None,
+        'test_table': test_table,
+        'test_labels': np. array(test_table['IS_LBG']) if test_table else None,
+        'test_z': np.array(test_table['Z_BEST']) if test_table else None,
+    }
+    
+    if verbose: 
+        print("\n" + "=" * 60)
+        print("Multi-Field Training Data Summary")
+        print("=" * 60)
+        
+        if train_table:
+            n_train = len(train_table)
+            n_train_pos = np.sum(train_table['IS_LBG'] == 1)
+            print(f"\n  Training set:")
+            print(f"    - Total:    {n_train}")
+            print(f"    - Positive: {n_train_pos} ({n_train_pos/n_train*100:.1f}%)")
+            print(f"    - Negative: {n_train - n_train_pos}")
+        
+        if test_table: 
+            n_test = len(test_table)
+            n_test_pos = np.sum(test_table['IS_LBG'] == 1)
+            print(f"\n  Test set ({test_field}):")
+            print(f"    - Total:    {n_test}")
+            print(f"    - Positive: {n_test_pos} ({n_test_pos/n_test*100:.1f}%)")
+            print(f"    - Negative:  {n_test - n_test_pos}")
+    
+    return result
